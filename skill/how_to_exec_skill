@@ -1,0 +1,648 @@
+# Claw Code Skill 执行流程深度分析
+
+> 本文章基于 [claw-code](https://github.com/instructkr/claw-code) 仓库源码分析，深入剖析 Skill 工具的完整执行链路。
+
+## 目录
+
+- [项目概述](#项目概述)
+- [环境准备](#环境准备)
+- [Skill 执行全景图](#skill-执行全景图)
+- [详细调用链路分析](#详细调用链路分析)
+  - [阶段 1: 终端监听服务](#阶段-1-终端监听服务)
+  - [阶段 2: REPL 主循环](#阶段-2-repl-主循环)
+  - [阶段 3: 会话轮次执行](#阶段-3-会话轮次执行)
+  - [阶段 4: 对话运行时核心](#阶段-4-对话运行时核心)
+  - [阶段 5: API 调用层](#阶段-5-api-调用层)
+  - [阶段 6: 工具执行器](#阶段-6-工具执行器)
+  - [阶段 7: 工具路由](#阶段-7-工具路由)
+  - [阶段 8: Skill 执行](#阶段-8-skill-执行)
+- [数据流总结](#数据流总结)
+- [关键源码文件索引](#关键源码文件索引)
+
+---
+
+## 项目概述
+
+**Claw Code** 是 Claude Code 泄漏源码的 Python/Rust 移植版本，核心是研究 **AI Agent 的 Harness 架构**（工具编排、运行时上下文、任务调度）。
+
+### 仓库结构
+
+```
+claw-code/
+├── src/                          # Python 移植版（架构映射）
+│   ├── main.py                   # Python CLI 入口
+│   ├── runtime.py                # 运行时 shim
+│   └── reference_data/           # JSON 快照
+│       ├── tools_snapshot.json   # 工具定义
+│       └── commands_snapshot.json
+│
+└── rust/                         # Rust 完整实现
+    └── crates/
+        ├── rusty-claude-cli/     # 主 CLI 二进制
+        │   └── src/main.rs       # 98KB，完整 REPL
+        ├── runtime/              # 运行时核心
+        │   └── src/conversation.rs
+        ├── api/                  # Anthropic API 客户端
+        └── tools/                # 工具实现
+            └── src/lib.rs
+```
+
+---
+
+## 环境准备
+
+```bash
+# 克隆仓库
+git clone https://github.com/instructkr/claw-code.git
+cd claw-code
+
+# 构建 Rust 版本
+cd rust
+cargo build --release -p rusty-claude-cli
+
+# 运行 CLI
+cargo run -p rusty-claude-cli -- --help
+```
+
+---
+
+## Skill 执行全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 用户输入: "帮我创建一个新 skill"                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. LineEditor 监听终端输入                                                    │
+│    文件: input.rs                                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. run_repl 主循环判断输入类型                                                │
+│    文件: main.rs:903-921                                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. LiveCli::run_turn() 执行对话轮次                                           │
+│    文件: main.rs:1011-1041                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. ConversationRuntime::run_turn() 对话运行时                                 │
+│    文件: runtime/src/conversation.rs:130-218                                  │
+│    - 添加用户消息到会话                                                        │
+│    - 调用 API 获取 LLM 响应                                                   │
+│    - 解析工具调用                                                              │
+│    - 执行工具并保存结果                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 5. AnthropicRuntimeClient::stream() API 调用                                 │
+│    文件: main.rs:1978-2091                                                    │
+│    - 构建 HTTP 请求（包含工具定义）                                             │
+│    - 建立 SSE 流式连接                                                        │
+│    - 解析 LLM 响应中的工具调用                                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ LLM 返回工具调用:                                                             │
+│ { "name": "Skill", "input": { "skill": "create-skill" } }                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 6. CliToolExecutor::execute() 工具执行器                                      │
+│    文件: main.rs:2265-2295                                                    │
+│    - 检查工具权限                                                              │
+│    - 解析 JSON 输入                                                           │
+│    - 调用 execute_tool()                                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 7. execute_tool() 工具路由                                                    │
+│    文件: tools/src/lib.rs:376-401                                             │
+│    - 根据工具名称分发到具体实现                                                 │
+│    - "Skill" => run_skill()                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 8. execute_skill() Skill 执行                                                 │
+│    文件: tools/src/lib.rs:1244-1256                                           │
+│    - resolve_skill_path() 查找 SKILL.md 文件                                  │
+│    - 读取文件内容                                                              │
+│    - 返回 SkillOutput                                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 返回结果并注入对话:                                                            │
+│ SkillOutput.prompt 被添加到会话上下文                                          │
+│ LLM 根据 skill 指令执行任务                                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 详细调用链路分析
+
+### 阶段 1: 终端监听服务
+
+**文件**: `rust/crates/rusty-claude-cli/src/input.rs`
+
+```rust
+pub struct LineEditor {
+    prompt: String,  // "> " 提示符
+    editor: Editor<SlashCommandHelper, DefaultHistory>,
+}
+```
+
+**职责**:
+- 使用 `rustyline` 库阻塞读取用户输入
+- 提供斜杠命令自动补全
+- 返回 `ReadOutcome::Submit(input)` 或 `ReadOutcome::Exit`
+
+**关键代码**:
+```rust
+// input.rs 内部使用 rustyline 库
+// 阻塞等待用户输入，支持历史记录和自动补全
+```
+
+---
+
+### 阶段 2: REPL 主循环
+
+**文件**: `rust/crates/rusty-claude-cli/src/main.rs:903-921`
+
+```rust
+fn run_repl(...) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
+
+    loop {
+        match editor.read_line()? {
+            input::ReadOutcome::Submit(input) => {
+                let trimmed = input.trim().to_string();
+
+                // 检查是否为斜杠命令
+                if let Some(command) = SlashCommand::parse(&trimmed) {
+                    cli.handle_repl_command(command)?;
+                    continue;
+                }
+
+                // 普通文本输入 → 走 run_turn
+                cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::Exit => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+```
+
+**职责**:
+- 区分斜杠命令（`/help`、`/status` 等）和普通文本
+- 斜杠命令走 `handle_repl_command()`
+- 普通文本走 `run_turn()`
+
+---
+
+### 阶段 3: 会话轮次执行
+
+**文件**: `rust/crates/rusty-claude-cli/src/main.rs:1011-1041`
+
+```rust
+fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 显示加载动画
+    let mut spinner = Spinner::new();
+    spinner.tick("🦀 Thinking...", ...);
+
+    // 2. 创建权限提示器
+    let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+
+    // 3. 调用 runtime 执行对话轮次
+    let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+
+    // 4. 处理结果
+    match result {
+        Ok(_) => {
+            spinner.finish("✨ Done");
+            self.persist_session()?;
+            Ok(())
+        }
+        Err(error) => {
+            spinner.fail("❌ Request failed");
+            Err(Box::new(error))
+        }
+    }
+}
+```
+
+**职责**:
+- 显示加载状态
+- 调用核心运行时
+- 持久化会话
+
+---
+
+### 阶段 4: 对话运行时核心
+
+**文件**: `rust/crates/runtime/src/conversation.rs:130-218`
+
+```rust
+pub fn run_turn(
+    &mut self,
+    user_input: &str,
+    mut prompter: Option<&mut dyn PermissionPrompter>,
+) -> Result<TurnSummary, RuntimeError> {
+    // 步骤 4.1: 添加用户消息
+    self.session.messages.push(ConversationMessage::user_text(user_input));
+
+    loop {
+        // 步骤 4.2: 构建 API 请求
+        let request = ApiRequest {
+            system_prompt: self.system_prompt.clone(),
+            messages: self.session.messages.clone(),
+        };
+
+        // 步骤 4.3: 调用 API
+        let events = self.api_client.stream(request)?;
+
+        // 步骤 4.4: 解析工具调用
+        let (assistant_message, usage) = build_assistant_message(events)?;
+        let pending_tool_uses: Vec<_> = assistant_message.blocks.iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => Some((id.clone(), name.clone(), input.clone())),
+                _ => None
+            })
+            .collect();
+
+        self.session.messages.push(assistant_message.clone());
+
+        if pending_tool_uses.is_empty() {
+            break;
+        }
+
+        // 步骤 4.5: 执行工具
+        for (tool_use_id, tool_name, input) in pending_tool_uses {
+            let permission_outcome = self.permission_policy.authorize(&tool_name, &input, prompter);
+
+            let result_message = match permission_outcome {
+                PermissionOutcome::Allow => {
+                    match self.tool_executor.execute(&tool_name, &input) {
+                        Ok(output) => ConversationMessage::tool_result(tool_use_id, tool_name, output, false),
+                        Err(error) => ConversationMessage::tool_result(tool_use_id, tool_name, error.to_string(), true),
+                    }
+                }
+                PermissionOutcome::Deny { reason } => {
+                    ConversationMessage::tool_result(tool_use_id, tool_name, reason, true)
+                }
+            };
+
+            self.session.messages.push(result_message);
+        }
+    }
+
+    Ok(TurnSummary { ... })
+}
+```
+
+**职责**:
+- 管理对话循环
+- 调用 API 获取 LLM 响应
+- 解析并执行工具调用
+- 权限控制
+
+---
+
+### 阶段 5: API 调用层
+
+**文件**: `rust/crates/rusty-claude-cli/src/main.rs:1978-2091`
+
+```rust
+impl ApiClient for AnthropicRuntimeClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        // 步骤 5.1: 构建 HTTP 请求
+        let message_request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: max_tokens_for_model(&self.model),
+            messages: convert_messages(&request.messages),
+            system: Some(request.system_prompt.join("\n\n")),
+            tools: self.enable_tools.then(|| {
+                filter_tool_specs(self.allowed_tools.as_ref())
+                    .into_iter()
+                    .map(|spec| ToolDefinition {
+                        name: spec.name.to_string(),
+                        description: Some(spec.description.to_string()),
+                        input_schema: spec.input_schema,
+                    })
+                    .collect()
+            }),
+            tool_choice: Some(ToolChoice::Auto),
+            stream: true,
+        };
+
+        // 步骤 5.2: 发送请求
+        self.runtime.block_on(async {
+            let mut stream = self.client.stream_message(&message_request).await?;
+
+            // 步骤 5.3: 解析 SSE 事件流
+            let mut events = Vec::new();
+            let mut pending_tool: Option<(String, String, String)> = None;
+
+            while let Some(event) = stream.next_event().await? {
+                match event {
+                    ApiStreamEvent::ContentBlockDelta(
+                        ContentBlockDelta::InputJsonDelta { partial_json }
+                    ) => {
+                        // 累积工具输入 JSON
+                        if let Some((_, _, input)) = &mut pending_tool {
+                            input.push_str(&partial_json);
+                        }
+                    }
+                    ApiStreamEvent::ContentBlockStop(_) => {
+                        // 完整工具调用
+                        if let Some((id, name, input)) = pending_tool.take() {
+                            events.push(AssistantEvent::ToolUse { id, name, input });
+                        }
+                    }
+                    // ...
+                }
+            }
+            Ok(events)
+        })
+    }
+}
+```
+
+**HTTP 请求示例**:
+```json
+POST https://api.anthropic.com/v1/messages
+Headers:
+  x-api-key: [API_KEY]
+  anthropic-version: 2023-06-01
+
+Body:
+{
+  "model": "claude-opus-4-6",
+  "max_tokens": 32000,
+  "messages": [{"role": "user", "content": "帮我创建一个新 skill"}],
+  "tools": [{"name": "Skill", "input_schema": {...}}],
+  "tool_choice": {"type": "auto"}
+}
+```
+
+---
+
+### 阶段 6: 工具执行器
+
+**文件**: `rust/crates/rusty-claude-cli/src/main.rs:2265-2295`
+
+```rust
+impl ToolExecutor for CliToolExecutor {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        // 步骤 6.1: 检查权限
+        if self.allowed_tools.as_ref()
+            .is_some_and(|allowed| !allowed.contains(tool_name))
+        {
+            return Err(ToolError::new(format!("tool `{tool_name}` is not enabled")));
+        }
+
+        // 步骤 6.2: 解析 JSON 输入
+        let value = serde_json::from_str(input)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+
+        // 步骤 6.3: 调用工具执行
+        match execute_tool(tool_name, &value) {
+            Ok(output) => {
+                let markdown = format_tool_result(tool_name, &output, false);
+                self.renderer.stream_markdown(&markdown, &mut io::stdout())?;
+                Ok(output)
+            }
+            Err(error) => {
+                let markdown = format_tool_result(tool_name, &error, true);
+                self.renderer.stream_markdown(&markdown, &mut io::stdout())?;
+                Err(ToolError::new(error))
+            }
+        }
+    }
+}
+```
+
+**参数传递**:
+```
+tool_name: "Skill"
+input: '{"skill":"create-skill","args":null}'
+```
+
+---
+
+### 阶段 7: 工具路由
+
+**文件**: `rust/crates/tools/src/lib.rs:376-401`
+
+```rust
+pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
+    match name {
+        "bash" => from_value::<BashCommandInput>(input).and_then(run_bash),
+        "read_file" => from_value::<ReadFileInput>(input).and_then(run_read_file),
+        "write_file" => from_value::<WriteFileInput>(input).and_then(run_write_file),
+        "edit_file" => from_value::<EditFileInput>(input).and_then(run_edit_file),
+
+        // Skill 工具路由
+        "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
+
+        "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
+        "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
+        // ...
+        _ => Err(format!("unsupported tool: {name}")),
+    }
+}
+```
+
+**Skill 工具定义**:
+```rust
+ToolSpec {
+    name: "Skill",
+    description: "Load a local skill definition and its instructions.",
+    input_schema: json!({
+        "type": "object",
+        "properties": {
+            "skill": { "type": "string" },
+            "args": { "type": "string" }
+        },
+        "required": ["skill"],
+    }),
+    required_permission: PermissionMode::ReadOnly,
+}
+```
+
+---
+
+### 阶段 8: Skill 执行
+
+**文件**: `rust/crates/tools/src/lib.rs:1244-1324`
+
+```rust
+// Skill 输入结构
+#[derive(Debug, Deserialize)]
+struct SkillInput {
+    skill: String,
+    args: Option<String>,
+}
+
+// Skill 输出结构
+#[derive(Debug, Serialize)]
+struct SkillOutput {
+    skill: String,
+    path: String,
+    args: Option<String>,
+    description: Option<String>,
+    prompt: String,
+}
+
+fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
+    // 步骤 8.1: 解析 skill 路径
+    let skill_path = resolve_skill_path(&input.skill)?;
+
+    // 步骤 8.2: 读取 SKILL.md 文件
+    let prompt = std::fs::read_to_string(&skill_path)
+        .map_err(|error| error.to_string())?;
+
+    // 步骤 8.3: 提取描述
+    let description = parse_skill_description(&prompt);
+
+    // 步骤 8.4: 返回结果
+    Ok(SkillOutput {
+        skill: input.skill,
+        path: skill_path.display().to_string(),
+        args: input.args,
+        description,
+        prompt,
+    })
+}
+
+fn resolve_skill_path(skill: &str) -> Result<PathBuf, String> {
+    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
+
+    let mut candidates = Vec::new();
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        candidates.push(PathBuf::from(codex_home).join("skills"));
+    }
+
+    for root in candidates {
+        let direct = root.join(requested).join("SKILL.md");
+        if direct.exists() {
+            return Ok(direct);
+        }
+    }
+
+    Err(format!("unknown skill: {requested}"))
+}
+
+fn parse_skill_description(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("description:") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+```
+
+**Skill 文件结构**:
+```
+$CODEX_HOME/skills/
+├── create-skill/
+│   └── SKILL.md
+├── create-agent/
+│   └── SKILL.md
+└── ...
+```
+
+**SKILL.md 格式**:
+```markdown
+description: Create a new agent skill for Qoder
+
+# Create Skill
+
+This skill teaches the agent how to create effective Agent Skills...
+```
+
+---
+
+## 数据流总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 数据变换流程                                                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 用户输入:                                                                │
+│   "帮我创建一个新 skill"                                                  │
+│                    ↓                                                    │
+│ LLM 分析意图:                                                            │
+│   生成工具调用请求                                                        │
+│                    ↓                                                    │
+│ 工具调用:                                                                │
+│   { "name": "Skill", "input": { "skill": "create-skill" } }             │
+│                    ↓                                                    │
+│ JSON 输入解析:                                                           │
+│   SkillInput { skill: "create-skill", args: None }                      │
+│                    ↓                                                    │
+│ 路径解析:                                                                │
+│   /home/user/.codex/skills/create-skill/SKILL.md                        │
+│                    ↓                                                    │
+│ 文件读取:                                                                │
+│   SKILL.md 完整内容                                                       │
+│                    ↓                                                    │
+│ 输出结果:                                                                │
+│   SkillOutput {                                                         │
+│     skill: "create-skill",                                              │
+│     path: "/home/user/.codex/.../SKILL.md",                             │
+│     description: "Create a new agent skill...",                         │
+│     prompt: "# Create Skill\n\n..."                                     │
+│   }                                                                     │
+│                    ↓                                                    │
+│ 注入对话:                                                                │
+│   prompt 内容被添加到 session.messages                                   │
+│   LLM 根据 skill 指令执行任务                                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 关键源码文件索引
+
+| 文件路径 | 职责 |
+|---------|------|
+| `rust/crates/rusty-claude-cli/src/main.rs` | CLI 主入口、REPL 循环、工具执行器实现 |
+| `rust/crates/rusty-claude-cli/src/input.rs` | 终端输入监听、自动补全 |
+| `rust/crates/runtime/src/conversation.rs` | 对话运行时核心、工具调用循环 |
+| `rust/crates/runtime/src/session.rs` | 会话管理 |
+| `rust/crates/runtime/src/permissions.rs` | 权限控制 |
+| `rust/crates/tools/src/lib.rs` | 工具定义与执行 |
+| `rust/crates/api/src/client.rs` | Anthropic API 客户端 |
+| `rust/crates/api/src/types.rs` | API 类型定义 |
+| `rust/crates/commands/src/lib.rs` | 斜杠命令定义 |
+
+---
+
+## 总结
+
+Claw Code 的 Skill 执行流程展现了现代 AI Agent 的 **Harness 架构** 设计精髓：
+
+1. **分层设计**: 终端层 → 运行时层 → API 层 → 工具层，职责清晰
+2. **流式处理**: SSE 流式响应，实时输出 LLM 生成内容
+3. **权限控制**: 每个工具调用都经过权限检查
+4. **插件化**: Skill 通过简单的 Markdown 文件定义，易于扩展
+5. **对话循环**: 工具执行结果反馈给 LLM，形成完整的 Agentic Loop
+
+这种架构设计为构建复杂的 AI Agent 系统提供了优雅的参考。
+
+---
+
+*文章基于 [claw-code](https://github.com/instructkr/claw-code) 仓库分析生成*
